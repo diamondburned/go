@@ -11,6 +11,7 @@ import (
 	exec "internal/execabs"
 	"io/ioutil"
 	"os"
+	"sync/atomic"
 )
 
 // run runs the command argv, feeding in stdin on standard input.
@@ -87,16 +88,22 @@ func lineno(pos token.Pos) string {
 func fatalf(msg string, args ...interface{}) {
 	// If we've already printed other errors, they might have
 	// caused the fatal condition. Assume they're enough.
-	if nerrors == 0 {
+	if !nerrors.has() {
 		fmt.Fprintf(os.Stderr, "cgo: "+msg+"\n", args...)
 	}
 	os.Exit(2)
 }
 
-var nerrors int
+type atomicNErrors uint64
+
+var nerrors atomicNErrors
+
+func (n *atomicNErrors) add()        { atomic.AddUint64((*uint64)(n), 1) }
+func (n *atomicNErrors) has() bool   { return n.get() > 0 }
+func (n *atomicNErrors) get() uint64 { return atomic.LoadUint64((*uint64)(n)) }
 
 func error_(pos token.Pos, msg string, args ...interface{}) {
-	nerrors++
+	nerrors.add()
 	if pos.IsValid() {
 		fmt.Fprintf(os.Stderr, "%s: ", fset.Position(pos).String())
 	} else {

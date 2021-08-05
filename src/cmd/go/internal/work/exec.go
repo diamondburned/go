@@ -2821,7 +2821,12 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		cgoflags = append(cgoflags, "-trimpath", strings.Join(trimpath, ";"))
 	}
 
-	if err := b.run(a, execdir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
+	nparallel := runtime.GOMAXPROCS(0)
+	if nparallel > 4 {
+		nparallel = 4
+	}
+
+	if err := b.run(a, execdir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-nparallel", strconv.Itoa(nparallel), "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
 		return nil, nil, err
 	}
 	outGo = append(outGo, gofiles...)

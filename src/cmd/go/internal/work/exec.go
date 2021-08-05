@@ -3001,6 +3001,16 @@ func buildFlags(name, defaults string, fromPackage []string, check func(string, 
 var cgoRe = lazyregexp.New(`[/\\:]`)
 
 func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgofiles, gccfiles, gxxfiles, mfiles, ffiles []string) (outGo, outObj []string, err error) {
+	nparallel := runtime.GOMAXPROCS(0)
+	if nparallel > 4 {
+		nparallel = 4
+	}
+
+	if len(ffiles) > 0 {
+		// Don't compile Fortran in parallel.
+		nparallel = 1
+	}
+
 	p := a.Package
 	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, cgoFFLAGS, cgoLDFLAGS, err := b.CFlags(p)
 	if err != nil {
@@ -3141,7 +3151,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		cgoflags = append(cgoflags, "-trimpath", strings.Join(trimpath, ";"))
 	}
 
-	if err := b.run(a, p.Dir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
+	if err := b.run(a, p.Dir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-nparallel", strconv.Itoa(nparallel), "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
 		return nil, nil, err
 	}
 	outGo = append(outGo, gofiles...)

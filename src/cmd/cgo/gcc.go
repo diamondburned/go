@@ -26,6 +26,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -486,7 +488,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 		}
 		needType = append(needType, n)
 	}
-	if nerrors > 0 {
+	if nerrors.has() {
 		// Check if compiling the preamble by itself causes any errors,
 		// because the messages we've printed out so far aren't helpful
 		// to users debugging preamble mistakes. See issue 8442.
@@ -743,9 +745,12 @@ func (p *Package) prepareNames(f *File) {
 			}
 		}
 		p.mangleName(n)
+
+		globalMu.Lock()
 		if n.Kind == "type" && typedef[n.Mangle] == nil {
 			typedef[n.Mangle] = n.Type
 		}
+		globalMu.Unlock()
 	}
 }
 
@@ -1040,7 +1045,7 @@ func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 		}
 		// Check whether this is a pointer to a C union (or class)
 		// type that contains a pointer.
-		if unionWithPointer[t.X] {
+		if isUnionWithPointer(t.X) {
 			return true
 		}
 		return p.hasPointer(f, t.X, false)
@@ -1063,7 +1068,10 @@ func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 				}
 			}
 		}
-		if def := typedef[t.Name]; def != nil {
+		globalMu.Lock()
+		def := typedef[t.Name]
+		globalMu.Unlock()
+		if def != nil {
 			return p.hasPointer(f, def.Go, top)
 		}
 		if t.Name == "string" {
@@ -1609,7 +1617,7 @@ func checkGCCBaseCmd() ([]string, error) {
 }
 
 // gccMachine returns the gcc -m flag to use, either "-m32", "-m64" or "-marm".
-func (p *Package) gccMachine() []string {
+func gccMachine() []string {
 	switch goarch {
 	case "amd64":
 		if goos == "darwin" {
@@ -1646,20 +1654,20 @@ func (p *Package) gccMachine() []string {
 	return nil
 }
 
-func gccTmp() string {
-	return *objDir + "_cgo_.o"
+func (p *Package) gccTmp() string {
+	return fmt.Sprintf("%s_%d_cgo_.o", *objDir, p.workerID)
 }
 
 // gccCmd returns the gcc command line to use for compiling
 // the input.
 func (p *Package) gccCmd() []string {
 	c := append(gccBaseCmd,
-		"-w",          // no warnings
-		"-Wno-error",  // warnings are not errors
-		"-o"+gccTmp(), // write object to tmp
-		"-gdwarf-2",   // generate DWARF v2 debugging symbols
-		"-c",          // do not link
-		"-xc",         // input language is C
+		"-w",            // no warnings
+		"-Wno-error",    // warnings are not errors
+		"-o"+p.gccTmp(), // write object to tmp
+		"-gdwarf-2",     // generate DWARF v2 debugging symbols
+		"-c",            // do not link
+		"-xc",           // input language is C
 	)
 	if p.GccIsClang {
 		c = append(c,
@@ -1682,7 +1690,7 @@ func (p *Package) gccCmd() []string {
 	}
 
 	c = append(c, p.GccOptions...)
-	c = append(c, p.gccMachine()...)
+	c = append(c, gccMachine()...)
 	if goos == "aix" {
 		c = append(c, "-maix64")
 		c = append(c, "-mcmodel=large")
@@ -1746,11 +1754,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		}
 	}
 
-	if f, err := macho.Open(gccTmp()); err == nil {
+	if f, err := macho.Open(p.gccTmp()); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", p.gccTmp(), err)
 		}
 		bo := f.ByteOrder
 		if f.Symtab != nil {
@@ -1824,11 +1832,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := elf.Open(gccTmp()); err == nil {
+	if f, err := elf.Open(p.gccTmp()); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", p.gccTmp(), err)
 		}
 		bo := f.ByteOrder
 		symtab, err := f.Symbols()
@@ -1924,11 +1932,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := pe.Open(gccTmp()); err == nil {
+	if f, err := pe.Open(p.gccTmp()); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", p.gccTmp(), err)
 		}
 		bo := binary.LittleEndian
 		for _, s := range f.Symbols {
@@ -1996,11 +2004,11 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		return d, ints, floats, strs
 	}
 
-	if f, err := xcoff.Open(gccTmp()); err == nil {
+	if f, err := xcoff.Open(p.gccTmp()); err == nil {
 		defer f.Close()
 		d, err := f.DWARF()
 		if err != nil {
-			fatalf("cannot load DWARF output from %s: %v", gccTmp(), err)
+			fatalf("cannot load DWARF output from %s: %v", p.gccTmp(), err)
 		}
 		bo := binary.BigEndian
 		for _, s := range f.Symbols {
@@ -2066,7 +2074,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 		buildStrings()
 		return d, ints, floats, strs
 	}
-	fatalf("cannot parse gcc output %s as ELF, Mach-O, PE, XCOFF object", gccTmp())
+	fatalf("cannot parse gcc output %s as ELF, Mach-O, PE, XCOFF object", p.gccTmp())
 	panic("not reached")
 }
 
@@ -2076,7 +2084,7 @@ func (p *Package) gccDebug(stdin []byte, nnames int) (d *dwarf.Data, ints []int6
 // and its included files.
 func (p *Package) gccDefines(stdin []byte) string {
 	base := append(gccBaseCmd, "-E", "-dM", "-xc")
-	base = append(base, p.gccMachine()...)
+	base = append(base, gccMachine()...)
 	stdout, _ := runGcc(stdin, append(append(base, p.GccOptions...), "-"))
 	return stdout
 }
@@ -2175,13 +2183,42 @@ type typeConv struct {
 	intSize int64
 }
 
-var tagGen int
+var tagGenCounter int64
+
+func genTag() int {
+	return int(atomic.AddInt64(&tagGenCounter, 1) - 1)
+}
+
+var globalMu sync.Mutex
 var typedef = make(map[string]*Type)
 var goIdent = make(map[string]*ast.Ident)
 
 // unionWithPointer is true for a Go type that represents a C union (or class)
 // that may contain a pointer. This is used for cgo pointer checking.
 var unionWithPointer = make(map[ast.Expr]bool)
+
+func unionWithPointerTrueIfKey(setKey, ifKey ast.Expr) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	if unionWithPointer[ifKey] {
+		unionWithPointer[setKey] = true
+	}
+}
+
+func isUnionWithPointer(key ast.Expr) bool {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	return unionWithPointer[key]
+}
+
+func unionWithPointerTrue(key ast.Expr) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	unionWithPointer[key] = true
+}
 
 // anonymousStructTag provides a consistent tag for an anonymous struct.
 // The same dwarf.StructType pointer will always get the same tag.
@@ -2522,9 +2559,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 		t.Size = t1.Size
 		t.Align = t1.Align
 		t.Go = t1.Go
-		if unionWithPointer[t1.Go] {
-			unionWithPointer[t.Go] = true
-		}
+		unionWithPointerTrueIfKey(t.Go, t1.Go)
 		t.EnumValues = nil
 		t.Typedef = ""
 		t.C.Set("%s "+dt.Qual, t1.C)
@@ -2538,18 +2573,21 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			break
 		}
 		if tag == "" {
+			globalMu.Lock()
 			tag = anonymousStructTag[dt]
 			if tag == "" {
-				tag = "__" + strconv.Itoa(tagGen)
-				tagGen++
+				tag = "__" + strconv.Itoa(genTag())
 				anonymousStructTag[dt] = tag
 			}
+			globalMu.Unlock()
 		} else if t.C.Empty() {
 			t.C.Set(dt.Kind + " " + tag)
 		}
 		name := c.Ident("_Ctype_" + dt.Kind + "_" + tag)
 		t.Go = name // publish before recursive calls
+		globalMu.Lock()
 		goIdent[name.Name] = name
+		globalMu.Unlock()
 		if dt.ByteSize < 0 {
 			// Don't override old type
 			if _, ok := typedef[name.Name]; ok {
@@ -2568,20 +2606,24 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			// all the cases badPointerTypedef used to handle, but hopefully will
 			// continue to work going forward without any more need for cgo changes.
 			tt.Go = c.Ident(incomplete)
+			globalMu.Lock()
 			typedef[name.Name] = &tt
+			globalMu.Unlock()
 			break
 		}
 		switch dt.Kind {
 		case "class", "union":
 			t.Go = c.Opaque(t.Size)
 			if c.dwarfHasPointer(dt, pos) {
-				unionWithPointer[t.Go] = true
+				unionWithPointerTrue(t.Go)
 			}
 			if t.C.Empty() {
 				t.C.Set("__typeof__(unsigned char[%d])", t.Size)
 			}
 			t.Align = 1 // TODO: should probably base this on field alignment.
+			globalMu.Lock()
 			typedef[name.Name] = t
+			globalMu.Unlock()
 		case "struct":
 			g, csyntax, align := c.Struct(dt, pos)
 			if t.C.Empty() {
@@ -2596,7 +2638,9 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			if c.incompleteStructs[tag] {
 				tt.Go = c.Ident(incomplete)
 			}
+			globalMu.Lock()
 			typedef[name.Name] = &tt
+			globalMu.Unlock()
 		}
 
 	case *dwarf.TypedefType:
@@ -2619,7 +2663,9 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			break
 		}
 		name := c.Ident("_Ctype_" + dt.Name)
+		globalMu.Lock()
 		goIdent[name.Name] = name
+		globalMu.Unlock()
 		akey := ""
 		if c.anonymousStructTypedef(dt) {
 			// only load type recursively for typedefs of anonymous
@@ -2634,10 +2680,12 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			s.BadPointer = true
 			sub = &s
 			// Make sure we update any previously computed type.
+			globalMu.Lock()
 			if oldType := typedef[name.Name]; oldType != nil {
 				oldType.Go = sub.Go
 				oldType.BadPointer = true
 			}
+			globalMu.Unlock()
 		}
 		if c.badVoidPointerTypedef(dt) {
 			// Treat this typedef as a pointer to a _cgopackage.Incomplete.
@@ -2665,11 +2713,10 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 		}
 		t.Go = name
 		t.BadPointer = sub.BadPointer
-		if unionWithPointer[sub.Go] {
-			unionWithPointer[t.Go] = true
-		}
+		unionWithPointerTrueIfKey(t.Go, sub.Go)
 		t.Size = sub.Size
 		t.Align = sub.Align
+		globalMu.Lock()
 		oldType := typedef[name.Name]
 		if oldType == nil {
 			tt := *t
@@ -2677,6 +2724,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			tt.BadPointer = sub.BadPointer
 			typedef[name.Name] = &tt
 		}
+		globalMu.Unlock()
 
 		// If sub.Go.Name is "_Ctype_struct_foo" or "_Ctype_union_foo" or "_Ctype_class_foo",
 		// use that as the Go form for this typedef too, so that the typedef will be interchangeable
@@ -2687,7 +2735,9 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 
 			if isStructUnionClass(sub.Go) {
 				// Use the typedef name for C code.
+				globalMu.Lock()
 				typedef[sub.Go.(*ast.Ident).Name].C = t.C
+				globalMu.Unlock()
 			}
 
 			// If we've seen this typedef before, and it
@@ -2747,8 +2797,12 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			}
 			s = strings.Replace(s, " ", "", -1)
 			name := c.Ident("_Ctype_" + s)
+
 			tt := *t
+			globalMu.Lock()
 			typedef[name.Name] = &tt
+			globalMu.Unlock()
+
 			if !*godefs {
 				t.Go = name
 			}

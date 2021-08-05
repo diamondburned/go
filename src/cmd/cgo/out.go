@@ -32,14 +32,13 @@ var (
 
 // writeDefs creates output files to be compiled by gc and gcc.
 func (p *Package) writeDefs() {
-	var fgo2, fc io.Writer
-	f := creat(*objDir + "_cgo_gotypes.go")
-	defer f.Close()
-	fgo2 = f
+	fgo2 := creat(*objDir + "_cgo_gotypes.go")
+	defer fgo2.Close()
+
+	var fc *os.File
 	if *gccgo {
-		f := creat(*objDir + "_cgo_defun.c")
-		defer f.Close()
-		fc = f
+		fc = creat(*objDir + "_cgo_defun.c")
+		defer fc.Close()
 	}
 	fm := creat(*objDir + "_cgo_main.c")
 
@@ -681,12 +680,11 @@ var isBuiltin = map[string]bool{
 
 func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 	name := n.Mangle
-	if isBuiltin[name] || p.Written[name] {
+	if isBuiltin[name] || !p.Written.Mark(name) {
 		// The builtins are already defined in the C prolog, and we don't
 		// want to duplicate function definitions we've already done.
 		return
 	}
-	p.Written[name] = true
 
 	if *gccgo {
 		p.writeGccgoOutputFunc(fgcc, n)
@@ -1292,7 +1290,7 @@ func (p *Package) writeExportHeader(fgcch io.Writer) {
 
 // gccgoToSymbol converts a name to a mangled symbol for gccgo.
 func gccgoToSymbol(ppath string) string {
-	if gccgoMangler == nil {
+	gccgoManglerOnce.Do(func() {
 		var err error
 		cmd := os.Getenv("GCCGO")
 		if cmd == "" {
@@ -1305,7 +1303,7 @@ func gccgoToSymbol(ppath string) string {
 		if err != nil {
 			fatalf("%v", err)
 		}
-	}
+	})
 	return gccgoMangler(ppath)
 }
 

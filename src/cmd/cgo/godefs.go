@@ -115,11 +115,11 @@ func (p *Package) godefs(f *File) string {
 	return buf.String()
 }
 
-var gofmtBuf bytes.Buffer
-
 // gofmt returns the gofmt-formatted string for an AST node.
 func gofmt(n interface{}) string {
-	gofmtBuf.Reset()
+	var gofmtBuf strings.Builder
+	gofmtBuf.Grow(512)
+
 	err := printer.Fprint(&gofmtBuf, fset, n)
 	if err != nil {
 		return "<" + err.Error() + ">"

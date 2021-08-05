@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"cmd/internal/edit"
 	"cmd/internal/objabi"
@@ -34,6 +35,8 @@ import (
 
 // A Package collects information about the package we're going to write.
 type Package struct {
+	workerID int
+
 	PackageName string // name of package
 	PackagePath string
 	PtrSize     int64
@@ -41,15 +44,34 @@ type Package struct {
 	GccOptions  []string
 	GccIsClang  bool
 	CgoFlags    map[string][]string // #cgo flags (CFLAGS, LDFLAGS)
-	Written     map[string]bool
-	Name        map[string]*Name // accumulated Name from Files
+	Written     *WrittenFiles
+	Name        map[string]*Name // TODO: parallelize. accumulated Name from Files
 	ExpFunc     []*ExpFunc       // accumulated ExpFunc from Files
-	Decl        []ast.Decl
-	GoFiles     []string        // list of Go files
-	GccFiles    []string        // list of gcc output files
-	Preamble    string          // collected preamble for _cgo_export.h
+	Decl        []ast.Decl       `json:"-"`
+	GoFiles     []string         // list of Go files
+	GccFiles    []string         // list of gcc output files
+	Preamble    string           // collected preamble for _cgo_export.h
+
 	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
 	typedefList []typedefInfo
+}
+
+type WrittenFiles struct {
+	mut     sync.Mutex
+	written map[string]struct{}
+}
+
+func (w *WrittenFiles) Mark(file string) (shouldWrite bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
+	_, already := w.written[file]
+	if already {
+		return false
+	}
+
+	w.written[file] = struct{}{}
+	return true
 }
 
 // A typedefInfo is an element on Package.typedefList: a typedef name
@@ -88,7 +110,7 @@ func nameKeys(m map[string]*Name) []string {
 
 // A Call refers to a call of a C.xxx function in the AST.
 type Call struct {
-	Call     *ast.CallExpr
+	Call     *ast.CallExpr `json:"-"`
 	Deferred bool
 	Done     bool
 }
@@ -96,7 +118,7 @@ type Call struct {
 // A Ref refers to an expression of the form C.xxx in the AST.
 type Ref struct {
 	Name    *Name
-	Expr    *ast.Expr
+	Expr    *ast.Expr `json:"-"`
 	Context astContext
 	Done    bool
 }
@@ -109,13 +131,13 @@ var nameKinds = []string{"iconst", "fconst", "sconst", "type", "var", "fpvar", "
 
 // A Name collects information about C.xxx.
 type Name struct {
-	Go       string // name used in Go referring to package C
-	Mangle   string // name used in generated Go
-	C        string // name used in C
-	Define   string // #define expansion
-	Kind     string // one of the nameKinds
-	Type     *Type  // the type of xxx
-	FuncType *FuncType
+	Go       string    // name used in Go referring to package C
+	Mangle   string    // name used in generated Go
+	C        string    // name used in C
+	Define   string    // #define expansion
+	Kind     string    // one of the nameKinds
+	Type     *Type     `json:"-"` // the type of xxx
+	FuncType *FuncType `json:"-"`
 	AddError bool
 	Const    string // constant definition
 }
@@ -134,23 +156,23 @@ func (n *Name) IsConst() bool {
 // Such functions are identified in the Go input file
 // by doc comments containing the line //export ExpName
 type ExpFunc struct {
-	Func    *ast.FuncDecl
-	ExpName string // name to use from C
+	Func    *ast.FuncDecl `json:"-"`
+	ExpName string        // name to use from C
 	Doc     string
 }
 
 // A TypeRepr contains the string representation of a type.
 type TypeRepr struct {
 	Repr       string
-	FormatArgs []interface{}
+	FormatArgs []interface{} `json:"-"`
 }
 
 // A Type collects information about a type in both the C and Go worlds.
 type Type struct {
 	Size       int64
 	Align      int64
-	C          *TypeRepr
-	Go         ast.Expr
+	C          *TypeRepr `json:"-"`
+	Go         ast.Expr  `json:"-"`
 	EnumValues map[string]int64
 	Typedef    string
 	BadPointer bool // this pointer type should be represented as a uintptr (deprecated)
@@ -224,6 +246,8 @@ var cPrefix string
 
 var fset = token.NewFileSet()
 
+var nparallel = flag.Int("nparallel", runtime.GOMAXPROCS(0), "maximum parallel jobs")
+
 var dynobj = flag.String("dynimport", "", "if non-empty, print dynamic import data for that file")
 var dynout = flag.String("dynout", "", "write -dynimport output to this file")
 var dynpackage = flag.String("dynpackage", "main", "set Go package for -dynimport output")
@@ -242,10 +266,12 @@ var exportHeader = flag.String("exportheader", "", "where to write export header
 var gccgo = flag.Bool("gccgo", false, "generate files for use with gccgo")
 var gccgoprefix = flag.String("gccgoprefix", "", "-fgo-prefix option used with gccgo")
 var gccgopkgpath = flag.String("gccgopkgpath", "", "-fgo-pkgpath option used with gccgo")
-var gccgoMangler func(string) string
 var importRuntimeCgo = flag.Bool("import_runtime_cgo", true, "import runtime/cgo in generated code")
 var importSyscall = flag.Bool("import_syscall", true, "import syscall in generated code")
 var trimpath = flag.String("trimpath", "", "applies supplied rewrites or trims prefixes to recorded source file paths")
+
+var gccgoMangler func(string) string
+var gccgoManglerOnce sync.Once
 
 var goarch, goos, gomips, gomips64 string
 
@@ -302,10 +328,10 @@ func main() {
 		}
 	}
 
-	p := newPackage(args[:i])
+	p := newPackage(args[:i], 0)
 
 	// We need a C compiler to be available. Check this.
-	gccName := p.gccBaseCmd()[0]
+	gccName := gccBaseCmd()[0]
 	_, err := exec.LookPath(gccName)
 	if err != nil {
 		fatalf("C compiler %q not found: %v", gccName, err)
@@ -370,43 +396,152 @@ func main() {
 	}
 	*objDir += string(filepath.Separator)
 
-	for i, input := range goFiles {
-		f := fs[i]
-		p.Translate(f)
-		for _, cref := range f.Ref {
-			switch cref.Context {
-			case ctxCall, ctxCall2:
-				if cref.Name.Kind != "type" {
-					break
-				}
-				old := *cref.Expr
-				*cref.Expr = cref.Name.Type.Go
-				f.Edit.Replace(f.offset(old.Pos()), f.offset(old.End()), gofmt(cref.Name.Type.Go))
-			}
-		}
-		if nerrors > 0 {
-			os.Exit(2)
-		}
-		p.PackagePath = f.Package
-		p.Record(f)
-		if *godefs {
-			os.Stdout.WriteString(p.godefs(f))
-		} else {
-			p.writeOutput(f, input)
-		}
-	}
+	pkgs := doFiles(p, goFiles, fs)
 
 	if !*godefs {
-		p.writeDefs()
+		pkg := coalescePackages(pkgs)
+		pkg.writeDefs()
 	}
-	if nerrors > 0 {
+
+	if nerrors.get() > 0 {
 		os.Exit(2)
 	}
 }
 
+type doFileJob struct {
+	input string
+	file  *File
+}
+
+func doFiles(p *Package, inputs []string, files []*File) []*Package {
+	if len(inputs) != len(files) {
+		fatalf("unexpected len(inputs) %d != len(files) %d", len(inputs), len(files))
+	}
+
+	jobCh := make(chan doFileJob)
+
+	var wg sync.WaitGroup
+	wg.Add(*nparallel)
+
+	pkgs := make([]*Package, *nparallel)
+	pkgs[0] = p
+
+	for n := 1; n < *nparallel; n++ {
+		pkgs[n] = cloneNewPackage(p, n)
+	}
+
+	for n := 0; n < *nparallel; n++ {
+		p := pkgs[n]
+		go func() {
+			doFileWorker(p, jobCh)
+			wg.Done()
+		}()
+	}
+
+	for i := range inputs {
+		jobCh <- doFileJob{
+			input: inputs[i],
+			file:  files[i],
+		}
+	}
+
+	close(jobCh)
+	wg.Wait()
+
+	return pkgs
+}
+
+func doFileWorker(p *Package, jobCh <-chan doFileJob) *Package {
+	for job := range jobCh {
+		doFile(p, job.input, job.file)
+	}
+
+	return p
+}
+
+func doFile(p *Package, input string, f *File) {
+	p.Translate(f)
+	for _, cref := range f.Ref {
+		switch cref.Context {
+		case ctxCall, ctxCall2:
+			if cref.Name.Kind != "type" {
+				break
+			}
+			old := *cref.Expr
+			*cref.Expr = cref.Name.Type.Go
+			f.Edit.Replace(f.offset(old.Pos()), f.offset(old.End()), gofmt(cref.Name.Type.Go))
+		}
+	}
+	if nerrors.get() > 0 {
+		os.Exit(2)
+	}
+	p.PackagePath = f.Package
+	p.Record(f)
+	if *godefs {
+		os.Stdout.WriteString(p.godefs(f))
+	} else {
+		p.writeOutput(f, input)
+	}
+}
+
+func cloneNewPackage(p *Package, workerID int) *Package {
+	return &Package{
+		workerID:    workerID,
+		PackageName: p.PackageName,
+		PackagePath: p.PackagePath,
+		PtrSize:     p.PtrSize,
+		IntSize:     p.IntSize,
+		GccOptions:  p.GccOptions, // init in main only
+		GccIsClang:  p.GccIsClang,
+		CgoFlags:    p.CgoFlags, // init in main only
+		Written:     p.Written,
+	}
+}
+
+func coalescePackages(pkgs []*Package) *Package {
+	if len(pkgs) == 0 {
+		return nil
+	}
+
+	nonEmpty := pkgs[:0]
+	for _, p := range pkgs {
+		if p.PackageName != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+
+	pkgs = nonEmpty
+	pkg := pkgs[0]
+
+	for _, p := range pkgs[1:] {
+		pkg.PackageName = p.PackageName
+		pkg.PackagePath = p.PackagePath
+		pkg.ExpFunc = append(pkg.ExpFunc, p.ExpFunc...)
+		pkg.Decl = append(pkg.Decl, p.Decl...)
+		pkg.GoFiles = append(pkg.GoFiles, p.GoFiles...)
+		pkg.GccFiles = append(pkg.GccFiles, p.GccFiles...)
+		pkg.Preamble += p.Preamble
+
+		if pkg.Name == nil && p.Name != nil {
+			pkg.Name = p.Name
+			continue
+		}
+
+		for k, v := range p.Name {
+			if o, ok := pkg.Name[k]; ok && !reflect.DeepEqual(v, o) {
+				fatalf("duplicate pkg.Name %s, %v == %v", k, v, o)
+			}
+
+			pkg.Name[k] = v
+		}
+	}
+
+	return pkg
+}
+
 // newPackage returns a new Package that will invoke
 // gcc with the additional arguments specified in args.
-func newPackage(args []string) *Package {
+func newPackage(args []string, workerID int) *Package {
 	goarch = runtime.GOARCH
 	if s := os.Getenv("GOARCH"); s != "" {
 		goarch = s
@@ -432,10 +567,13 @@ func newPackage(args []string) *Package {
 	os.Setenv("LC_ALL", "C")
 
 	p := &Package{
+		workerID: workerID,
 		PtrSize:  ptrSize,
 		IntSize:  intSize,
 		CgoFlags: make(map[string][]string),
-		Written:  make(map[string]bool),
+		Written: &WrittenFiles{
+			written: make(map[string]struct{}),
+		},
 	}
 	p.addToFlag("CFLAGS", args)
 	return p

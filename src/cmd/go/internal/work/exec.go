@@ -2821,48 +2821,70 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		return objdir + fmt.Sprintf("_x%03d.o", oseq)
 	}
 
+	jobCh := make(chan func() error)
+	jobErrCh := make(chan error)
+
+	nparallel := gccConcurrency(a)
+	go func() { jobErrCh <- runJobDispatcher(nparallel, jobCh) }()
+
 	// gcc
 	cflags := str.StringList(cgoCPPFLAGS, cgoCFLAGS)
 	for _, cfile := range cfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, objdir+cfile); err != nil {
-			return nil, nil, err
-		}
+		cfile := cfile
 		outObj = append(outObj, ofile)
+
+		jobCh <- func() error {
+			return b.gcc(a, p, a.Objdir, ofile, cflags, objdir+cfile)
+		}
 	}
 
 	for _, file := range gccfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
-			return nil, nil, err
-		}
+		ifile := file
 		outObj = append(outObj, ofile)
+
+		jobCh <- func() error {
+			return b.gcc(a, p, a.Objdir, ofile, cflags, ifile)
+		}
 	}
 
 	cxxflags := str.StringList(cgoCPPFLAGS, cgoCXXFLAGS)
 	for _, file := range gxxfiles {
 		ofile := nextOfile()
-		if err := b.gxx(a, p, a.Objdir, ofile, cxxflags, file); err != nil {
-			return nil, nil, err
-		}
+		ifile := file
 		outObj = append(outObj, ofile)
+
+		jobCh <- func() error {
+			return b.gxx(a, p, a.Objdir, ofile, cxxflags, ifile)
+		}
 	}
 
 	for _, file := range mfiles {
 		ofile := nextOfile()
-		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
-			return nil, nil, err
-		}
+		ifile := file
 		outObj = append(outObj, ofile)
+
+		jobCh <- func() error {
+			return b.gcc(a, p, a.Objdir, ofile, cflags, ifile)
+		}
 	}
 
 	fflags := str.StringList(cgoCPPFLAGS, cgoFFLAGS)
 	for _, file := range ffiles {
 		ofile := nextOfile()
-		if err := b.gfortran(a, p, a.Objdir, ofile, fflags, file); err != nil {
-			return nil, nil, err
-		}
+		ifile := file
 		outObj = append(outObj, ofile)
+
+		jobCh <- func() error {
+			return b.gfortran(a, p, a.Objdir, ofile, fflags, ifile)
+		}
+	}
+
+	close(jobCh)
+
+	if err := <-jobErrCh; err != nil {
+		return nil, nil, err
 	}
 
 	switch cfg.BuildToolchainName {
@@ -2961,6 +2983,51 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	}
 
 	return outGo, outObj, nil
+}
+
+// gccConcurrency returns the concurrency level for spawning gcc processes.
+func gccConcurrency(a *Action) int {
+	gcflags := str.StringList(forcedGcflags, a.Package.Internal.Gcflags)
+	return gcBackendConcurrency(gcflags)
+}
+
+func runJobDispatcher(nparallel int, jobCh <-chan func() error) error {
+	var wg sync.WaitGroup
+
+	var firstErr error
+	var errNum int
+	var errMut sync.Mutex
+
+	semaphore := make(chan struct{}, nparallel)
+
+	for job := range jobCh {
+		job := job
+
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			if err := job(); err != nil {
+				errMut.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errNum++
+				errMut.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if errNum > 0 {
+		return fmt.Errorf("encountered %d errors, including: %w", errNum, firstErr)
+	}
+
+	return nil
 }
 
 // dynimport creates a Go source file named importGo containing

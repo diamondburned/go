@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // godefs returns the output for -godefs mode.
@@ -114,12 +115,19 @@ func (p *Package) godefs(f *File, args []string) string {
 	return buf.String()
 }
 
-var gofmtBuf strings.Builder
+var gofmtPool = sync.Pool{
+	New: func() interface{} {
+		return new(strings.Builder)
+	},
+}
 
 // gofmt returns the gofmt-formatted string for an AST node.
 func gofmt(n interface{}) string {
-	gofmtBuf.Reset()
-	err := printer.Fprint(&gofmtBuf, fset, n)
+	gofmtBuf := gofmtPool.Get().(*strings.Builder)
+	defer gofmtPool.Put(gofmtBuf)
+	defer gofmtBuf.Reset()
+
+	err := printer.Fprint(gofmtBuf, fset, n)
 	if err != nil {
 		return "<" + err.Error() + ">"
 	}
